@@ -143,9 +143,15 @@ class Network(Component):
                 conditions.energy.busses[bus.tag].current_draw  = -conditions.energy.busses[bus.tag].power_draw/bus.voltage
     
             else:
+                # ---- Sarla local patch #3 (per-bus accounting) ------------------------------------------
+                # `total_elec_power` accumulates across ALL busses but was then used as THIS bus's demand,
+                # so with two or more busses each bus was charged every previous bus's power as well. Track
+                # this bus's own draw separately; the running total is still what the genset is sized to.
+                bus_elec_power = 0. * state.ones_row(1)
+                # ---- end Sarla local patch #3 ---------------------------------------------------------
                 for propulsor_group in bus.assigned_propulsors:
                     stored_results_flag  = False
-                    stored_propulsor_tag = None   
+                    stored_propulsor_tag = None
                     for propulsor_tag in propulsor_group:
                         propulsor =  network.propulsors[propulsor_tag]
                         if propulsor.active and bus.active:       
@@ -162,11 +168,12 @@ class Network(Component):
     
                             total_thrust      += T   
                             total_moment      += M   
-                            total_mech_power  += P_mech 
-                            total_elec_power  += P_elec 
-    
+                            total_mech_power  += P_mech
+                            total_elec_power  += P_elec
+                            bus_elec_power    += P_elec    # Sarla patch #3: this bus only
+
                 # compute power from each component
-                conditions.energy.busses[bus.tag].power_draw        += (total_elec_power- state.conditions.energy.busses[bus.tag].regenerative_power*bus_voltage ) * bus.power_split_ratio  /bus.efficiency
+                conditions.energy.busses[bus.tag].power_draw        += (bus_elec_power- state.conditions.energy.busses[bus.tag].regenerative_power*bus_voltage ) * bus.power_split_ratio  /bus.efficiency
                 conditions.energy.busses[bus.tag].current_draw       = conditions.energy.busses[bus.tag].power_draw/bus_voltage
              
         # ------------------------------------------------------------------------------------------------------------------- 
@@ -177,25 +184,42 @@ class Network(Component):
             if fuel_line.active: 
                 for converter_group in fuel_line.assigned_converters:
                     stored_conveter_tag = False
+
+                    # ---- Sarla local patch #3 (energy balance) ------------------------------------------
+                    # Every Turboelectric_Generator in a group was commanded the FULL bus demand
+                    # `total_elec_power*(1-phi)` and each then subtracted its whole output from the bus, so
+                    # N gensets supplied the bus N times over. Measured on RCAIDE's own VnV
+                    # series_hybrid_electric_ATR_72 (2 gensets): at phi=0.0 the bus needed 1021 kWh, the
+                    # gensets delivered 2042 kWh, and bus power_draw went to -1021 kWh -- 100% over-supply,
+                    # with fuel burn doubled to match. Share the demand across the active generators.
+                    n_active_generators = sum(
+                        1 for _ct in converter_group
+                        if converters[_ct].active and isinstance(
+                            converters[_ct],
+                            RCAIDE.Library.Components.Powertrain.Converters.Turboelectric_Generator)
+                    )
+                    generator_share = 1.0 / n_active_generators if n_active_generators else 1.0
+                    # ---- end Sarla local patch #3 ------------------------------------------------------
+
                     for converter_tag in converter_group:
                         converter =  converters[converter_tag]
                         if converter.active:
                             converter.inverse_calculation = True
-                            if isinstance(converter,RCAIDE.Library.Components.Powertrain.Converters.Pump):  
+                            if isinstance(converter,RCAIDE.Library.Components.Powertrain.Converters.Pump):
                                 P_mech, P_elec, stored_results_flag,stored_conveter_tag          = converter.compute_performance(state,fuel_line)   
                                 conditions.energy.fuel_lines[fuel_line.tag].fuel_mass_flow_rate += conditions.energy.converters[converter.tag].fuel_mass_flow_rate   
                                 
                             if isinstance(converter,RCAIDE.Library.Components.Powertrain.Converters.Turboelectric_Generator): 
                                 if stored_conveter_tag is False:
-                                    generator             = converter.generator   
-                                    state.conditions.energy.converters[generator.tag].outputs.power  =  total_elec_power*(1 - state.conditions.energy.hybrid_power_split_ratio ) 
-                                    P_mech, P_elec, stored_results_flag,stored_conveter_tag          = converter.compute_performance(state,fuel_line,bus)  
+                                    generator             = converter.generator
+                                    state.conditions.energy.converters[generator.tag].outputs.power  =  total_elec_power*(1 - state.conditions.energy.hybrid_power_split_ratio )*generator_share  # Sarla patch #3
+                                    P_mech, P_elec, stored_results_flag,stored_conveter_tag          = converter.compute_performance(state,fuel_line,bus)
                                     conditions.energy.busses[bus.tag].power_draw                    -= P_elec/bus.efficiency
                                     conditions.energy.fuel_lines[fuel_line.tag].fuel_mass_flow_rate += conditions.energy.converters[converter.tag].fuel_mass_flow_rate   
                                 else:
-                                    generator             = converter.generator   
-                                    state.conditions.energy.converters[generator.tag].outputs.power  =  total_elec_power*(1 - state.conditions.energy.hybrid_power_split_ratio ) 
-                                    P_mech, P_elec                                                   = converter.reuse_stored_data(state,network,stored_conveter_tag,fuel_line,bus)  
+                                    generator             = converter.generator
+                                    state.conditions.energy.converters[generator.tag].outputs.power  =  total_elec_power*(1 - state.conditions.energy.hybrid_power_split_ratio )*generator_share  # Sarla patch #3
+                                    P_mech, P_elec                                                   = converter.reuse_stored_data(state,network,stored_conveter_tag,fuel_line,bus)
                                     conditions.energy.busses[bus.tag].power_draw                     -= P_elec/bus.efficiency
                                     conditions.energy.fuel_lines[fuel_line.tag].fuel_mass_flow_rate  += conditions.energy.converters[converter.tag].fuel_mass_flow_rate   
 
